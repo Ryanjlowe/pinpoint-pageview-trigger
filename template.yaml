@@ -1,0 +1,307 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Forward incoming SES Emails to Pinpoint Segment
+
+Parameters:
+  PinpointProjectId:
+    Type: String
+    Description: Amazon Pinpoint Project ID
+    Default: 781d224052ce4160a3625971c83388a8
+  UserPageViewTableName:
+    Type: String
+    Default: "userPageViews"
+    Description: Name of the DynamoDB table to persist page views of users
+
+
+Mappings:
+  SES:
+    RuleSet:
+      RuleSetName: "default-rule-set"
+
+Resources:
+
+  PageViewAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      FailOnWarnings: true
+      Name: PageViewAPI
+
+  ApiGatewayAccount:
+    Type: 'AWS::ApiGateway::Account'
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchLogsRole.Arn
+
+  ApiGatewayCloudWatchLogsRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: ApiGatewayLogsPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                  - 'logs:PutLogEvents'
+                  - 'logs:GetLogEvents'
+                  - 'logs:FilterLogEvents'
+                Resource: '*'
+
+  PageViewAPIStage:
+    DependsOn:
+      - ApiGatewayAccount
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      DeploymentId: !Ref ApiDeployment
+      MethodSettings:
+        - DataTraceEnabled: true
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          ResourcePath: /*
+      RestApiId: !Ref PageViewAPI
+      StageName: LATEST
+
+  ApiDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn:
+      - PageViewRequest
+    Properties:
+      RestApiId: !Ref PageViewAPI
+      StageName: DummyStage
+
+  PageViewResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref PageViewAPI
+      ParentId: !GetAtt PageViewAPI.RootResourceId
+      PathPart: pageview
+
+  PageViewRequest:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:dynamodb:action/UpdateItem"
+        IntegrationResponses:
+          - StatusCode: 200
+        Credentials: !GetAtt PageViewRequestRole.Arn
+        RequestTemplates:
+          "application/json": !Sub |
+            {
+              "TableName": "${UserPageViewTableName}",
+              "ReturnValues": "UPDATED_NEW",
+              "ExpressionAttributeValues": {
+                ":a": {"N": "1"},
+                ":zero": {"N": "0"}
+              },
+              "ExpressionAttributeNames": {
+                "#v": "PageCount"
+              },
+              "UpdateExpression": "SET #v = if_not_exists(#v, :zero) + :a",
+              "Key": {
+                "EndpointId": {
+                  "S": "$input.path('$.endpointId')"
+                },
+                "PageName": {
+                  "S": "$input.path('$.pageName')"
+                }
+              }
+            }
+
+
+      RequestParameters:
+        method.request.querystring.name: false
+      ResourceId: !Ref PageViewResource
+      RestApiId: !Ref PageViewAPI
+      MethodResponses:
+        - StatusCode: 200
+
+  PageViewRequestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "dynamodb:UpdateItem"
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UserPageViewTableName}"
+
+
+  UserPageViewTableDynamoDBName:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        -
+          AttributeName: "EndpointId"
+          AttributeType: "S"
+        -
+          AttributeName: "PageName"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "EndpointId"
+          KeyType: "HASH"
+        -
+          AttributeName: "PageName"
+          KeyType: "RANGE"
+      ProvisionedThroughput:
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+      TableName: !Ref UserPageViewTableName
+      StreamSpecification:
+        StreamViewType: "NEW_IMAGE"
+
+  UpdatePinpointLambdaSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt UserPageViewTableDynamoDBName.StreamArn
+      FunctionName: !GetAtt UpdatePinpointLambda.Arn
+      StartingPosition: "TRIM_HORIZON"
+
+
+  UpdatePinpointLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt UpdatePinpointLambdaRole.Arn
+      Runtime: "python3.7"
+      Timeout: 60
+      Environment:
+        Variables:
+          PINPOINT_PROJECT_ID: !Ref PinpointProjectId
+          LOG_LEVEL: 'INFO'
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import datetime
+          import boto3
+          import logging
+          import base64
+          import os
+          from botocore.exceptions import ClientError
+
+          pinpoint = boto3.client('pinpoint')
+
+          PINPOINT_PROJECT_ID = os.environ.get('PINPOINT_PROJECT_ID')
+
+          def lambda_handler(event, context):
+
+            global log_level
+            log_level = str(os.environ.get('LOG_LEVEL')).upper()
+            if log_level not in [
+                                    'DEBUG', 'INFO',
+                                    'WARNING', 'ERROR',
+                                    'CRITICAL'
+                                ]:
+                log_level = 'ERROR'
+            logging.getLogger().setLevel(log_level)
+
+            logging.info(event)
+
+
+            for record in event['Records']:
+              try:
+                payload = record['dynamodb']['NewImage']
+                endpointId = payload['EndpointId']['S']
+                pageName = payload['PageName']['S']
+                pageCount = payload['PageCount']['N']
+
+                response = pinpoint.put_events(
+                  ApplicationId = PINPOINT_PROJECT_ID,
+                  EventsRequest={
+                      'BatchItem': {
+                          endpointId: {
+                              'Endpoint': {},
+                              'Events':{
+                                  'pageViewId': {
+                                      'Attributes':{
+                                        'PageName': pageName
+                                      },
+                                      'Metrics': {
+                                        'PageCount': float(pageCount)
+                                      },
+                                      'EventType': 'PageViewCount',
+                                      'Timestamp': datetime.datetime.fromtimestamp(time.time()).isoformat()
+                                  }
+                              }
+                          }
+                      }
+                  }
+                )
+                logging.info(response)
+
+              except Exception as e:
+                logging.error('Received Error while processing payload: %s', e)
+
+
+
+  UpdatePinpointLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "dynamodb:DescribeStream"
+                  - "dynamodb:GetRecords"
+                  - "dynamodb:GetShardIterator"
+                  - "dynamodb:ListStreams"
+                Resource: !GetAtt UserPageViewTableDynamoDBName.StreamArn
+              -
+                Effect: "Allow"
+                Action:
+                  - "mobiletargeting:PutEvents"
+                Resource:
+                  - !Sub "arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointProjectId}*"
