@@ -245,7 +245,8 @@ Resources:
                               'Events':{
                                   'pageViewId': {
                                       'Attributes':{
-                                        'PageName': pageName
+                                        'PageName': pageName,
+                                        'PageCount': pageCount
                                       },
                                       'Metrics': {
                                         'PageCount': float(pageCount)
