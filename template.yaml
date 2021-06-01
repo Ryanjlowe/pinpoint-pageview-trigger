@@ -5,7 +5,6 @@ Parameters:
   PinpointProjectId:
     Type: String
     Description: Amazon Pinpoint Project ID
-    Default: 781d224052ce4160a3625971c83388a8
   UserPageViewTableName:
     Type: String
     Default: "userPageViews"
@@ -306,3 +305,8 @@ Resources:
                   - "mobiletargeting:PutEvents"
                 Resource:
                   - !Sub "arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointProjectId}*"
+
+Outputs:
+  RestEndpoint:
+    Description: New Endpoint for PageView API, locaiton to send POST request
+    Value: !Sub "https://${PageViewAPI}.execute-api.${AWS::Region}.amazonaws.com/DummyStage/pageview"
